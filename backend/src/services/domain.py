@@ -9,17 +9,15 @@ FEATURES = {
     'ready_pct': ('预备区到位率', '%', '≤', '先核清缺袋，再由预备区班组补足同批砂袋、核对托盘签，复测到位率后叫车。'),
     'queued_trucks': ('待装车辆', '辆', '>', '按空闲装车位分批叫号，下一车在候车区等待领班确认。'),
 }
-SUBSETS = (
-    ('常量基线', ()),
-    ('装载工作量', ('planned_bags', 'scheduled_loaders')),
-    ('场地准备', ('ready_pct', 'queued_trucks')),
-    ('全部班前特征', tuple(FEATURES)),
-)
+FEATURE_ORDER = tuple(FEATURES)
+# 每个装车位候选规则的固定顺序：停用在前，随后按特征列顺序，同分组合按此顺序取首项。
+OFF_KEY = 'off'
 NUMERIC_LIMITS = {
     'planned_bags': (1, 10000), 'scheduled_loaders': (1, 100),
     'ready_pct': (0, 100), 'queued_trucks': (0, 100), 'elapsed_min': (1, 1440),
 }
 TIME_FORMAT = '%Y-%m-%d %H:%M'
+WINDOW_SECONDS = 3600  # 叫车计入本批及往前不足一小时的预警
 
 
 @dataclass(frozen=True)
@@ -33,29 +31,46 @@ class Leaf:
 
 
 @dataclass(frozen=True)
-class Stump:
-    left: Leaf
-    feature: str | None = None
+class Rule:
+    """单条件预警规则；key 为 off 表示该装车位停用，全部转常规。"""
+    bay: str
+    key: str
+    train_cost: int
     threshold: float | None = None
-    right: Leaf | None = None
+    left_alert: bool = False
+    right_alert: bool = False
 
-    def leaves(self):
-        if self.right is None:
-            return (('全批次', self.left),)
-        label, unit, _, _ = FEATURES[self.feature]
+    @property
+    def disabled(self):
+        return self.key == OFF_KEY
+
+    @property
+    def label(self):
+        return '停用' if self.disabled else FEATURES[self.key][0]
+
+    def summary(self):
+        if self.disabled:
+            return f'{self.bay}停用（本车位全部转常规）'
+        feature_label, unit, _, _ = FEATURES[self.key]
         return (
-            (f'{label} ≤ {self.threshold:g} {unit}', self.left),
-            (f'{label} > {self.threshold:g} {unit}', self.right),
+            f'{self.bay} · {feature_label} ≤ {self.threshold:g} {unit} → '
+            f'{"预警" if self.left_alert else "常规"}；'
+            f'{feature_label} > {self.threshold:g} {unit} → {"预警" if self.right_alert else "常规"}'
         )
 
-    def branch_index(self, row):
-        return int(self.feature is not None and row[self.feature] > self.threshold)
+    def wants_alert(self, row):
+        if self.disabled:
+            return False
+        side = int(row[self.key] > self.threshold)
+        return self.right_alert if side else self.left_alert
 
     def trace(self, row):
-        path, leaf = self.leaves()[self.branch_index(row)]
-        if self.feature is None:
-            return path, leaf
-        return f'{path}（实测 {row[self.feature]} {FEATURES[self.feature][1]}）', leaf
+        if self.disabled:
+            return self.summary() + '（不发预警）'
+        feature_label, unit, _, _ = FEATURES[self.key]
+        side = int(row[self.key] > self.threshold)
+        mark = '>' if side else '≤'
+        return f'{self.bay} · {feature_label} {mark} {self.threshold:g} {unit}（实测 {row[self.key]} {unit}）'
 
 
 def sample_rows() -> list[dict]:
@@ -89,9 +104,10 @@ def _integer(value, low, high):
     return type(value) is int and low <= value <= high
 
 
-def _time_groups(rows, deadline):
+def _parse_time(rows):
     groups = defaultdict(list)
     seen = set()
+    timed = []
     for index, row in enumerate(rows, start=1):
         batch = row.get('batch_id')
         bay = row.get('loading_bay')
@@ -111,15 +127,27 @@ def _time_groups(rows, deadline):
             if not _integer(row.get(name), low, high):
                 label = FEATURES[name][0] if name in FEATURES else '实耗分钟'
                 raise ValueError(f'批次 {batch} 的{label}无效，请填写 {low} 至 {high} 的整数。')
-        groups[timestamp.date().isoformat()].append({**row, 'overdue': row['elapsed_min'] > deadline})
+        enriched = {**row, 'loading_bay': bay.strip(), 'batch_id': batch.strip(),
+                    '_ts': timestamp, 'overdue': row['elapsed_min'] > row['deadline_min']}
+        groups[timestamp.date().isoformat()].append(enriched)
+        timed.append(enriched)
+    if len({row['loading_bay'] for row in timed}) < 2:
+        raise ValueError('联合比选需要两处装车位的台账，请补齐另一装车位的记录。')
     if len(groups) < 4:
         raise ValueError('至少需要四个不同排车日期，请补齐训练日、选择日和留出日的记录。')
     for date, day in groups.items():
         if len(day) < 4:
             raise ValueError(f'{date} 不足四个批次，请补齐当日台账后重跑。')
-    days = [sorted(groups[date], key=lambda row: (row['planned_at'], row['batch_id'])) for date in sorted(groups)]
+    days = [sorted(groups[date], key=lambda row: (row['planned_at'], row['batch_id']))
+            for date in sorted(groups)]
+    return days
+
+
+def split_days(rows, deadline):
+    """按本地排车日期切整日组：最晚日留出，倒数第二日选模型，其余日期拟合。"""
+    days = _parse_time([{**row, 'deadline_min': deadline} for row in rows])
     train = [row for day in days[:-2] for row in day]
-    return train, days[-2], days[-1]
+    return train, days[-2], days[-1], sorted({row['loading_bay'] for day in days for row in day})
 
 
 def _require_both_outcomes(name, rows):
@@ -131,14 +159,18 @@ def _leaf(total, overdue, miss_cost):
     return Leaf(total, overdue, overdue * miss_cost > total - overdue)
 
 
-def _fit(train, allowed, miss_cost):
+def fit_bay_rules(bay, train, miss_cost):
+    """单个装车位的候选：停用 + 每个特征各一条最优深度一单条件规则。
+
+    阈值取相邻不同训练值的中点，每叶至少两批；同特征同训练代价保留更低阈值。
+    """
     total = len(train)
     overdue = sum(row['overdue'] for row in train)
-    best = Stump(_leaf(total, overdue, miss_cost))
-    best_cost = best.left.loss(miss_cost)
-    for feature in allowed:
+    candidates = [Rule(bay, OFF_KEY, overdue * miss_cost)]  # 停用：全部常规，超时全部计漏报
+    for feature in FEATURE_ORDER:
         ordered = sorted(train, key=lambda row: row[feature])
         left_overdue = 0
+        best = None
         for left_total, (last_left, first_right) in enumerate(zip(ordered, ordered[1:]), start=1):
             left_overdue += last_left['overdue']
             right_total = total - left_total
@@ -147,19 +179,95 @@ def _fit(train, allowed, miss_cost):
             left = _leaf(left_total, left_overdue, miss_cost)
             right = _leaf(right_total, overdue - left_overdue, miss_cost)
             cost = left.loss(miss_cost) + right.loss(miss_cost)
-            if cost < best_cost:
+            if best is None or cost < best.train_cost:  # 升序扫描：持平即更低阈值先入选
                 threshold = (last_left[feature] + first_right[feature]) / 2
-                best = Stump(left, feature, threshold, right)
-                best_cost = cost
-    return best
+                best = Rule(bay, feature, cost, threshold, left.alert, right.alert)
+        if best is not None:
+            candidates.append(best)
+    return candidates
 
 
-def _score(model, rows, miss_cost):
-    leaves = (model.left, model.right)
-    alerts = [leaves[model.branch_index(row)].alert for row in rows]
-    false_alerts = sum(alert and not row['overdue'] for alert, row in zip(alerts, rows))
-    misses = sum(not alert and row['overdue'] for alert, row in zip(alerts, rows))
-    return false_alerts, misses, false_alerts + misses * miss_cost
+def replay_day(rules_by_bay, day_rows, quota, miss_cost):
+    """按叫车时间与批次号顺序回放整日，两处装车位共用一个每小时名额窗口。
+
+    每次叫车计入本批及往前不足一小时内已发出的预警；不足名额才发预警，
+    满额则该批转常规。实耗只用于事后计分，不影响发预警过程。
+    """
+    sent = []  # (timestamp, row) 仅记录实际发出的预警
+    details = []
+    totals = {'false_alerts': 0, 'misses': 0, 'cost': 0, 'skipped': 0, 'sent': 0}
+    for row in sorted(day_rows, key=lambda item: (item['_ts'], item['batch_id'])):
+        rule = rules_by_bay[row['loading_bay']]
+        wants = rule.wants_alert(row)
+        window = [item for item in sent if (row['_ts'] - item[0]).total_seconds() < WINDOW_SECONDS]
+        if wants and len(window) < quota:
+            sent.append((row['_ts'], row))
+            status, reason = '预警', '名额内发出'
+            false_alert = int(not row['overdue'])
+            miss = 0
+            totals['sent'] += 1
+        elif wants:
+            status, reason = '满额转常规', f'近一小时已发 {len(window)} 条，名额 {quota} 已满'
+            false_alert = 0
+            miss = int(row['overdue'])
+            totals['skipped'] += 1
+        else:
+            status, reason = '常规', '规则未命中' + ('（停用）' if rule.disabled else '')
+            false_alert = 0
+            miss = int(row['overdue'])
+        cost = false_alert + miss * miss_cost
+        totals['false_alerts'] += false_alert
+        totals['misses'] += miss
+        totals['cost'] += cost
+        details.append({
+            'batch_id': row['batch_id'], 'bay': row['loading_bay'], 'planned_at': row['planned_at'],
+            'rule': rule.summary(), 'trace': rule.trace(row), 'status': status, 'reason': reason,
+            'elapsed_min': row['elapsed_min'], 'overdue': row['overdue'],
+            'window_alerts': len(window) + (1 if status == '预警' else 0),
+            'false_alert': false_alert, 'miss': miss, 'cost': cost,
+        })
+    return totals, details
+
+
+def replay_verdicts(verdict_rows, quota, miss_cost):
+    """按受理时冻结的逐批规则结论回放（排车记录版本化使用，不依赖班前特征原值）。
+
+    verdict_rows 每项含 batch_id/loading_bay/planned_at/_ts/elapsed_min/overdue/
+    wants_alert/trace。名额窗口、满额转常规与计分口径与 replay_day 完全一致。
+    """
+    sent = []
+    details = []
+    totals = {'false_alerts': 0, 'misses': 0, 'cost': 0, 'skipped': 0, 'sent': 0}
+    for row in sorted(verdict_rows, key=lambda item: (item['_ts'], item['batch_id'])):
+        wants = bool(row['wants_alert'])
+        window = [item for item in sent if (row['_ts'] - item[0]).total_seconds() < WINDOW_SECONDS]
+        if wants and len(window) < quota:
+            sent.append((row['_ts'], row))
+            status, reason = '预警', '名额内发出'
+            false_alert = int(not row['overdue'])
+            miss = 0
+            totals['sent'] += 1
+        elif wants:
+            status, reason = '满额转常规', f'近一小时已发 {len(window)} 条，名额 {quota} 已满'
+            false_alert = 0
+            miss = int(row['overdue'])
+            totals['skipped'] += 1
+        else:
+            status, reason = '常规', '规则未命中'
+            false_alert = 0
+            miss = int(row['overdue'])
+        cost = false_alert + miss * miss_cost
+        totals['false_alerts'] += false_alert
+        totals['misses'] += miss
+        totals['cost'] += cost
+        details.append({
+            'batch_id': row['batch_id'], 'bay': row['loading_bay'], 'planned_at': row['planned_at'],
+            'trace': row['trace'], 'status': status, 'reason': reason,
+            'elapsed_min': row['elapsed_min'], 'overdue': row['overdue'],
+            'window_alerts': len(window) + (1 if status == '预警' else 0),
+            'false_alert': false_alert, 'miss': miss, 'cost': cost,
+        })
+    return totals, details
 
 
 def _record(section, subject, path, result, count, overdue, errors=None):
@@ -170,94 +278,184 @@ def _record(section, subject, path, result, count, overdue, errors=None):
     }
 
 
-def _summary(model):
-    return '；'.join(f'{path} → {"预警" if leaf.alert else "常规"}' for path, leaf in model.leaves())
+def _constant_baseline_score(day_rows, miss_cost):
+    """常量基线（预先确定的对照）：全批次常量预警，按逐批口径计分，不走名额抑制。"""
+    false_alerts = sum(not row['overdue'] for row in day_rows)
+    return {'false_alerts': false_alerts, 'misses': 0, 'cost': false_alerts,
+            'skipped': 0, 'sent': len(day_rows)}
 
 
-def _recommendation(model, validation_gain, holdout_gain):
-    if model.feature is None or validation_gain <= 0 or holdout_gain <= 0:
-        return '维持现行装车顺序。由交接班长补记等待原因与实到人员，积累新班次后再复跑。'
-    label, _, expected, action = FEATURES[model.feature]
-    path, _ = model.leaves()[0 if model.left.alert else 1]
-    if model.left.alert != (expected == '≤'):
-        return f'预警分支为「{path}」。先由班长核对{label}的登记时点并抽查缺袋、排队或出勤记录，维持现行装车顺序。'
-    return f'建议下一班试行。班长在叫车前检查「{path}」。命中时，{action}记录干预前后读数和完装分钟，由交接班复核。'
+def _standalone_score(rule, rows, miss_cost):
+    """不考虑名额时，单条规则在一批记录上的原始误报/漏报代价（用于训练叶展示）。"""
+    false_alerts = misses = 0
+    for row in rows:
+        alert = rule.wants_alert(row)
+        false_alerts += int(alert and not row['overdue'])
+        misses += int((not alert) and row['overdue'])
+    return false_alerts, misses, false_alerts + misses * miss_cost
 
 
 def compute(rows: list[dict], options: dict) -> dict:
     deadline = options.get('deadline_min', 35)
     miss_cost = options.get('miss_cost', 4)
+    quota = options.get('alert_quota', 3)
     if not _integer(deadline, 15, 90):
         raise ValueError('超时线须为 15 至 90 的整数分钟，请核对装车交接约定。')
     if not _integer(miss_cost, 1, 20):
         raise ValueError('漏报代价须为 1 至 20 的整数，请按误报为 1 的口径填写。')
-    train, validation, holdout = _time_groups(rows, deadline)
+    if not _integer(quota, 1, 50):
+        raise ValueError('每小时预警名额须为 1 至 50 的整数，请按补袋班可承接的并发量填写。')
+
+    train, validation, holdout, bays = split_days(rows, deadline)
     _require_both_outcomes('训练期', train)
     _require_both_outcomes('选择日', validation)
-    candidates = [
-        (name, _fit(train, features, miss_cost)) for name, features in SUBSETS
-    ]
-    validation_scores = [_score(model, validation, miss_cost) for _, model in candidates]
-    chosen = min(range(len(candidates)), key=lambda index: (validation_scores[index][2], index))
-    name, model = candidates[chosen]
-    baseline = candidates[0][1]
     _require_both_outcomes('留出日', holdout)
-    held_baseline = _score(baseline, holdout, miss_cost)
-    held_score = held_baseline if chosen == 0 else _score(model, holdout, miss_cost)
-    validation_gain = validation_scores[0][2] - validation_scores[chosen][2]
-    holdout_gain = held_baseline[2] - held_score[2]
-    recommendation = _recommendation(model, validation_gain, holdout_gain)
+    for bay in bays:
+        bay_train = [row for row in train if row['loading_bay'] == bay]
+        if len(bay_train) < 4:
+            raise ValueError(f'{bay} 训练批次不足四批，无法拟合单条件规则，请补齐该装车位台账。')
+        _require_both_outcomes(f'{bay}训练期', bay_train)
 
-    details = [
-        _record('选择日比较', candidate, _summary(stump), '入选' if index == chosen else '备选',
-                len(validation), sum(row['overdue'] for row in validation), validation_scores[index])
-        for index, (candidate, stump) in enumerate(candidates)
-    ]
-    details.append(_record('留出日汇总', name, _summary(model), '入选模型', len(holdout),
-                           sum(row['overdue'] for row in holdout), held_score))
-    if chosen:
-        details.append(_record('留出日汇总', candidates[0][0], _summary(baseline), '留出对照', len(holdout),
-                               sum(row['overdue'] for row in holdout), held_baseline))
-    details.extend(
-        _record('训练叶', name, path, '预警' if leaf.alert else '常规', leaf.total, leaf.overdue)
-        for path, leaf in model.leaves()
-    )
-    for row in holdout:
-        path, leaf = model.trace(row)
-        actual = row['overdue']
-        false_alert = int(leaf.alert and not actual)
-        miss = int(not leaf.alert and actual)
+    # 每装车位候选（停用 + 每特征一条中点规则），固定顺序用于同分裁决。
+    candidates_by_bay = {bay: fit_bay_rules(bay, [r for r in train if r['loading_bay'] == bay], miss_cost)
+                         for bay in bays}
+
+    # 选择日：枚举两处装车位候选的全部可行组合，按共享名额回放取总代价最低。
+    combos = []
+    first_bay, second_bay = bays[0], bays[1]
+    for index_a, rule_a in enumerate(candidates_by_bay[first_bay]):
+        for index_b, rule_b in enumerate(candidates_by_bay[second_bay]):
+            totals, _ = replay_day({first_bay: rule_a, second_bay: rule_b}, validation, quota, miss_cost)
+            combos.append({
+                'rules': {first_bay: rule_a, second_bay: rule_b},
+                'order': (index_a, index_b), 'totals': totals,
+            })
+    chosen = min(combos, key=lambda item: (item['totals']['cost'], item['order']))
+    chosen_rules = chosen['rules']
+    validation_totals = chosen['totals']
+
+    # 留出日：沿用选择日定型的规则与同一名额参数，按叫车时间和批次号回放。
+    holdout_totals, holdout_details = replay_day(chosen_rules, holdout, quota, miss_cost)
+    baseline_totals = _constant_baseline_score(holdout, miss_cost)
+    holdout_gain = baseline_totals['cost'] - holdout_totals['cost']
+    validation_baseline = _constant_baseline_score(validation, miss_cost)
+
+    details = []
+    # 选择日组合比选（全部可行组合，固定顺序同分裁决可复核）
+    for rank, combo in enumerate(sorted(combos, key=lambda item: (item['totals']['cost'], item['order'])), start=1):
+        rule_a, rule_b = combo['rules'][first_bay], combo['rules'][second_bay]
+        totals = combo['totals']
         details.append(_record(
-            '留出批次', f"{row['batch_id']} · {row['loading_bay']} · {row['planned_at']}", path,
-            f"{'预警' if leaf.alert else '常规'} / 实耗 {row['elapsed_min']} 分钟（{'超时' if actual else '按时'}）",
-            1, int(actual), (false_alert, miss, false_alert + miss * miss_cost),
+            '选择日组合', f'#{rank} {first_bay}：{rule_a.label} / {second_bay}：{rule_b.label}',
+            f'{rule_a.summary()} ‖ {rule_b.summary()}',
+            '入选' if combo is chosen else '备选', len(validation),
+            sum(row['overdue'] for row in validation),
+            (totals['false_alerts'], totals['misses'], totals['cost']),
         ))
-    details.append(_record('流程建议', '下一班班长', _summary(model), recommendation, None, None))
+    # 各装车位候选规则与训练叶
+    for bay in bays:
+        for rule in candidates_by_bay[bay]:
+            bay_train = [row for row in train if row['loading_bay'] == bay]
+            score = _standalone_score(rule, bay_train, miss_cost)
+            details.append(_record(
+                '候选规则', f'{bay} · {rule.label}', rule.summary(),
+                '入选' if chosen_rules[bay] is rule else '候选',
+                len(bay_train), sum(row['overdue'] for row in bay_train), score,
+            ))
+    # 留出日汇总（入选组合与常量基线）
+    details.append(_record(
+        '留出日汇总', '入选组合', ' ‖ '.join(rule.summary() for rule in chosen_rules.values()),
+        '入选规则', len(holdout), sum(row['overdue'] for row in holdout),
+        (holdout_totals['false_alerts'], holdout_totals['misses'], holdout_totals['cost']),
+    ))
+    details.append(_record(
+        '留出日汇总', '常量基线', '两处装车位全批次常量预警（预先确定的逐批对照，不占名额）', '留出对照',
+        len(holdout), sum(row['overdue'] for row in holdout),
+        (baseline_totals['false_alerts'], baseline_totals['misses'], baseline_totals['cost']),
+    ))
+    # 因满额跳过的批次
+    skipped = [item for item in holdout_details if item['status'] == '满额转常规']
+    for item in skipped:
+        details.append(_record(
+            '满额跳过批次', f"{item['batch_id']} · {item['bay']} · {item['planned_at']}",
+            item['trace'], item['reason'], 1, int(item['overdue']),
+            (item['false_alert'], item['miss'], item['cost']),
+        ))
+    # 留出批次逐条判断路径与实耗（实耗只计分）
+    for item in holdout_details:
+        details.append(_record(
+            '留出批次', f"{item['batch_id']} · {item['bay']} · {item['planned_at']}", item['trace'],
+            f"{item['status']} / 实耗 {item['elapsed_min']} 分钟（{'超时' if item['overdue'] else '按时'}）",
+            1, int(item['overdue']), (item['false_alert'], item['miss'], item['cost']),
+        ))
+
+    recommendation = _recommendation(chosen_rules, bays, holdout_gain, holdout_totals['skipped'])
+    details.append(_record('流程建议', '下一班补袋班与装车班长',
+                           ' ‖ '.join(rule.summary() for rule in chosen_rules.values()),
+                           recommendation, None, None))
 
     train_first = train[0]['planned_at'][:10]
     train_last = train[-1]['planned_at'][:10]
     validation_date = validation[0]['planned_at'][:10]
     holdout_date = holdout[0]['planned_at'][:10]
+    chosen_labels = '；'.join(f'{bay}选{chosen_rules[bay].label}' for bay in bays)
+    headline = (f'{chosen_labels}。{holdout_date} 留出日代价 {holdout_totals["cost"]}，'
+                f'常量基线 {baseline_totals["cost"]}，满额跳过 {holdout_totals["skipped"]} 批。')
     return {
-        'headline': f'{name}入选，{holdout_date} 留出日的代价为 {held_score[2]}，常量基线为 {held_baseline[2]}。',
+        'headline': headline,
         'metrics': {
             '训练批次': len(train), '选择日批次': len(validation), '留出日批次': len(holdout),
-            '入选选择日代价': validation_scores[chosen][2], '入选留出日代价': held_score[2],
-            '留出日基线代价': held_baseline[2], '留出日误报': held_score[0], '留出日漏报': held_score[1],
+            '每小时名额': quota,
+            '入选选择日代价': validation_totals['cost'],
+            '选择日基线代价': validation_baseline['cost'],
+            '入选留出日代价': holdout_totals['cost'], '留出日基线代价': baseline_totals['cost'],
+            '留出日误报': holdout_totals['false_alerts'], '留出日漏报': holdout_totals['misses'],
+            '留出日发出预警': holdout_totals['sent'], '满额跳过批次': holdout_totals['skipped'],
         },
         'rows': details,
         'notes': [
             recommendation,
-            f'本地排车日期整日隔离。{train_first} 至 {train_last} 拟合，{validation_date} 比较特征组，'
-            f'{holdout_date} 只评估入选模型和预先确定的常量基线。选定后沿用训练规则。',
-            f'实耗严格超过 {deadline} 分钟算超时。代价 = 误报 × 1 + 漏报 × {miss_cost}。'
-            '叶内选择训练代价最低的预测，持平则输出常规。相邻训练值的中点可作阈值，每叶至少两批。'
-            '同训练代价依次保留常量、特征列顺序、更低阈值。选择日持平时按表中组序取首项。',
-            '装载实耗仅用于标注和回测。演示结果来自模拟站点，流程试行后需用新的交班记录验证实际成效。',
+            f'本地排车日期整日隔离。{train_first} 至 {train_last} 分车位拟合，{validation_date} 联合比选两处装车位的'
+            f'单条件规则，{holdout_date} 只按定型规则与同一名额参数做留出评估。',
+            f'每装车位候选含「停用」与 {len(FEATURE_ORDER)} 个特征各自最优的深度一单条件规则；'
+            '阈值取该车位相邻不同训练值的中点，每叶至少两批，同特征同训练代价取更低阈值。',
+            f'选择日枚举两处车位候选的全部组合，按叫车时间回放：每次叫车计入本批及往前不足一小时（严格 <60 分钟）'
+            f'内已发预警，两处合计不超过名额 {quota}；总代价最低者入选，同分按「停用优先、特征列顺序、'
+            '一号位优先于二号位」的固定顺序裁决。',
+            f'留出日沿用入选规则，按叫车时间和批次号发预警，满额批次转常规；误报 × 1 + 漏报 × {miss_cost} 计分，'
+            '满额转常规仅在实际超时时计漏报。实耗严格超过 '
+            f'{deadline} 分钟算超时，且只参与超时标注与计分，不参与发预警决策。',
+            '演示结果来自模拟站点，流程试行后需用新的交班记录验证实际成效。',
         ],
-        'chart': {'label': '选择日各特征组代价', 'unit': '代价点', 'points': [
-            {'label': candidate, 'value': score[2]}
-            for (candidate, _), score in zip(candidates, validation_scores)
+        'chart': {'label': '选择日组合代价（前 10 组）', 'unit': '代价点', 'points': [
+            {'label': f"{combo['rules'][first_bay].label}+{combo['rules'][second_bay].label}",
+             'value': combo['totals']['cost']}
+            for combo in sorted(combos, key=lambda item: (item['totals']['cost'], item['order']))[:10]
         ]},
         'can_publish': True,
+        # 供排车记录版本化重放使用的定型规则（可 JSON 序列化）
+        'selected_rules': [
+            {'bay': bay, 'key': chosen_rules[bay].key, 'threshold': chosen_rules[bay].threshold,
+             'left_alert': chosen_rules[bay].left_alert, 'right_alert': chosen_rules[bay].right_alert,
+             'train_cost': chosen_rules[bay].train_cost, 'summary': chosen_rules[bay].summary()}
+            for bay in bays
+        ],
+        'bays': bays,
     }
+
+
+def _recommendation(chosen_rules, bays, holdout_gain, skipped):
+    if holdout_gain <= 0:
+        return ('留出日代价未低于常量基线，维持现行叫车顺序。由交接班长补记等待原因与实到人员，'
+                '积累新班次后再复跑。')
+    parts = []
+    for bay in bays:
+        rule = chosen_rules[bay]
+        if rule.disabled:
+            parts.append(f'{bay}停用单条件预警，全部按常规叫车')
+            continue
+        label, unit, _, action = FEATURES[rule.key]
+        alert_path = '≤' if rule.left_alert else '>'
+        parts.append(f'{bay}在叫车前检查{label} {alert_path} {rule.threshold:g} {unit}，命中时{action}')
+    tail = f'近 {skipped} 批因满额转常规，需向补袋班说明并核对其处置记录。' if skipped else ''
+    return '建议下一班试行。' + '；'.join(parts) + '。' + tail + '记录干预前后读数和完装分钟，由交接班复核。'

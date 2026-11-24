@@ -21,6 +21,16 @@ deliveries = Table('report_deliveries', metadata, Column('id', Integer, primary_
                    Column('schedule_id', Integer, nullable=False), Column('run_id', Integer, nullable=False),
                    Column('recipient', String(100), nullable=False), Column('scheduled', Double, nullable=False),
                    Column('delivered', Double, nullable=False), UniqueConstraint('schedule_id', 'scheduled'))
+dispatch_records = Table('dispatch_records', metadata, Column('id', Integer, primary_key=True),
+                        Column('dispatch_no', String(60), nullable=False), Column('version', Integer, nullable=False),
+                        Column('parent_id', Integer), Column('run_id', Integer, nullable=False),
+                        Column('state', String(16), nullable=False, index=True),
+                        Column('rule_snapshot', JSON, nullable=False), Column('options_snapshot', JSON, nullable=False),
+                        Column('payload', JSON, nullable=False), Column('replay', JSON),
+                        Column('owner', String(40), nullable=False),
+                        Column('created', Double, nullable=False), Column('accepted', Double),
+                        Column('finished', Double),
+                        UniqueConstraint('dispatch_no', 'version'))
 audit = Table('operation_audit', metadata, Column('id', Integer, primary_key=True),
               Column('at', Double, nullable=False), Column('actor', String(40), nullable=False),
               Column('action', String(30), nullable=False), Column('subject', Integer, nullable=False))

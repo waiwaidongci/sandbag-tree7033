@@ -6,8 +6,10 @@ from src.config.settings import ARTIFACTS
 from src.constants.enums import Role
 from src.controllers.query import delivery_status, jobs, recent_activity, require_row, revisions
 from src.models.tables import datasets, runs
-from src.schemas.requests import Delivery, Import, Login, Review, Run
+from src.schemas.requests import (Delivery, DispatchCorrect, DispatchCreate, Import, Login, Review, Run)
 from src.services.data import PROFILE, csv_records, save_revision
+from src.services.dispatch import (DispatchError, accept_dispatch, correct_dispatch, create_dispatch,
+                                   finish_dispatch, list_dispatch, resume_dispatch)
 from src.services.domain import sample_rows
 from src.services.workflow import add_run, cancel_schedule, review_run, schedule_report
 from src.utils.exports import write_csv
@@ -16,6 +18,7 @@ from src.utils.security import allowed, authenticate, signed_in
 router = APIRouter()
 analyst = allowed(Role.analyst.value)
 reviewer = allowed(Role.reviewer.value)
+operator = allowed(Role.analyst.value, Role.reviewer.value)
 
 
 @router.post('/login')
@@ -90,6 +93,48 @@ def schedule(key: int, body: Delivery, account=Depends(reviewer)):
 @router.get('/delivery')
 def delivery(account=Depends(signed_in)):
     return delivery_status()
+
+
+@router.get('/dispatch')
+def dispatch_list(dispatch_no: str | None = None, account=Depends(signed_in)):
+    return list_dispatch(dispatch_no)
+
+
+@router.post('/dispatch', status_code=201)
+def dispatch_create(body: DispatchCreate, account=Depends(operator)):
+    try:
+        return create_dispatch(body, account['username'])
+    except DispatchError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@router.post('/dispatch/{key}/corrections', status_code=201)
+def dispatch_correct(key: int, body: DispatchCorrect, account=Depends(operator)):
+    try:
+        return correct_dispatch(key, body, account['username'])
+    except DispatchError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@router.post('/dispatch/{key}/accept')
+def dispatch_accept(key: int, account=Depends(operator)):
+    try:
+        return accept_dispatch(key, account['username'])
+    except DispatchError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@router.post('/dispatch/{key}/finish')
+def dispatch_finish(key: int, account=Depends(operator)):
+    try:
+        return finish_dispatch(key, account['username'])
+    except DispatchError as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@router.get('/dispatch/{key}/resume')
+def dispatch_resume(key: int, account=Depends(signed_in)):
+    return resume_dispatch(key)
 
 
 @router.delete('/schedules/{key}')
