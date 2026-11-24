@@ -1,0 +1,15 @@
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@400;600;700&family=Young+Serif&display=swap');
+:root {
+  --text-font: 'Atkinson Hyperlegible Next'; --title-font: 'Young Serif';
+  --paper: oklch(.975 .012 88); --surface: oklch(.994 .006 88);
+  --ink: oklch(.235 .035 88); --quiet: oklch(.435 .038 88);
+  --stripe: oklch(.961 .014 88); --rule: oklch(.858 .024 88);
+  --accent: oklch(.445 0.106 88); --button-ink: oklch(.98 .007 88);
+  --focus: oklch(.64 0.106 88);
+  --side: oklch(.258 .041 88);
+  --side-ink: oklch(.975 .011 88);
+  --highlight: oklch(.36 .047 88);
+  --highlight-edge: oklch(.762 .096 88);
+  --side-width: 272px; --side-pad: 1.65rem;
+  --login-ratio: 1.86fr; --report-stripe: 3px;
+}
